@@ -83,10 +83,14 @@ fn serve_snapshot(request: tiny_http::Request, shared: SharedFrame, quality: u8)
 }
 
 fn serve_mjpeg(request: tiny_http::Request, shared: SharedFrame, quality: u8) -> Result<()> {
-    let content_type = format!("multipart/x-mixed-replace; boundary={BOUNDARY}");
-    let header = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()).unwrap();
-    let response = Response::empty(200).with_header(header);
-    let mut writer = request.into_writer(response)?;
+    let mut writer = request.into_writer();
+    write!(writer, "HTTP/1.1 200 OK\r\n")?;
+    write!(writer, "Content-Type: multipart/x-mixed-replace; boundary={BOUNDARY}\r\n")?;
+    write!(writer, "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n")?;
+    write!(writer, "Pragma: no-cache\r\n")?;
+    write!(writer, "Connection: close\r\n")?;
+    write!(writer, "\r\n")?;
+    writer.flush()?;
 
     let mut last_seq: u64 = 0;
     loop {

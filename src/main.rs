@@ -15,9 +15,13 @@ mod relay;
     long_about = None,
 )]
 struct Cli {
-    /// Index of the capture device to open. Omit to list devices and exit.
+    /// Index of the capture device to open. Omit to pick interactively.
     #[arg(short, long)]
     device: Option<u32>,
+
+    /// Print the list of devices and exit. Useful for scripts.
+    #[arg(long)]
+    list: bool,
 
     /// Requested width. The device picks the closest supported mode.
     #[arg(long)]
@@ -49,8 +53,15 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let Some(device_index) = cli.device else {
-        return capture::list_devices();
+    if cli.list {
+        let devices = capture::enumerate()?;
+        capture::print_devices(&devices);
+        return Ok(());
+    }
+
+    let device_index = match cli.device {
+        Some(i) => i,
+        None => capture::pick_device_interactive()?,
     };
 
     let request = capture::CaptureRequest {

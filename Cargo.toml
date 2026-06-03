@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+dialoguer = { version = "0.11", default-features = false }
 nokhwa = { version = "0.10", features = ["input-msmf", "input-native"] }
 softbuffer = "0.4"
 winit = "0.30"
