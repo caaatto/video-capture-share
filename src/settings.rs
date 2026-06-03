@@ -12,6 +12,7 @@ pub struct Settings {
     pub borderless: bool,
     pub always_on_top: bool,
     pub hide_cursor: bool,
+    pub language: crate::i18n::Language,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,7 @@ impl Default for Settings {
             borderless: false,
             always_on_top: false,
             hide_cursor: true,
+            language: crate::i18n::Language::default(),
         }
     }
 }

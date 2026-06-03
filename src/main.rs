@@ -6,7 +6,10 @@ use std::sync::Arc;
 
 mod audio;
 mod capture;
+mod config;
 mod frame;
+mod i18n;
+mod perf;
 mod preview;
 mod relay;
 mod settings;
@@ -106,7 +109,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let device_index = match cli.device {
+    // Load persisted config first; CLI flags win over it on conflicts.
+    let cfg = config::load();
+
+    let device_index = match cli.device.or(cfg.capture.device_index) {
         Some(i) => i,
         None => capture::pick_device_interactive()?,
     };
@@ -125,19 +131,21 @@ fn main() -> Result<()> {
 
     let request = capture::CaptureRequest {
         device_index,
-        width: cli.width,
-        height: cli.height,
-        fps: cli.fps,
+        width: cli.width.or(cfg.capture.width),
+        height: cli.height.or(cfg.capture.height),
+        fps: cli.fps.or(cfg.capture.fps),
         force_mjpeg: cli.allow_mjpeg,
     };
 
-    let shared_settings = Arc::new(Mutex::new(settings::Settings {
-        jpeg_quality: cli.quality,
-        ..settings::Settings::default()
-    }));
+    let mut initial_settings = config::settings_from_config(&cfg);
+    // CLI quality overrides config; if user didn't pass --quality the clap
+    // default of 75 wins which matches the config default anyway.
+    initial_settings.jpeg_quality = cli.quality;
+    let shared_settings = Arc::new(Mutex::new(initial_settings));
 
+    let target_fps = cli.fps.or(cfg.capture.fps).unwrap_or(60);
     let capture_info = settings::CaptureInfo {
-        fps_target: cli.fps.unwrap_or(60),
+        fps_target: target_fps,
         format_label: if cli.allow_mjpeg { "any".into() } else { "raw preferred".into() },
     };
 
@@ -159,10 +167,32 @@ fn main() -> Result<()> {
             .context("failed to start capture thread")?
     );
 
-    let audio_runtime = if cli.audio {
-        let hint = cli.audio_device.as_deref().or(video_device_name.as_deref());
-        match audio::start(hint, cli.audio_delay_ms) {
-            Ok(rt) => Some(Arc::new(rt)),
+    let audio_enabled = cli.audio || cfg.audio.enabled;
+    let audio_delay = if cli.audio_delay_ms != 100 {
+        cli.audio_delay_ms
+    } else {
+        cfg.audio.delay_ms
+    };
+    let audio_runtime = if audio_enabled {
+        let hint = cli
+            .audio_device
+            .as_deref()
+            .or(cfg.audio.input_device.as_deref())
+            .or(video_device_name.as_deref());
+        match audio::start(hint, audio_delay) {
+            Ok(rt) => {
+                // Apply persisted audio prefs.
+                rt.state.set_volume(cfg.audio.volume_percent);
+                rt.state.set_muted(cfg.audio.muted);
+                if let Some(out) = cfg.audio.output_device.as_deref() {
+                    if !out.is_empty() && out != rt.state.output_name() {
+                        if let Err(e) = rt.set_output(out) {
+                            log::warn!("could not restore output device '{out}': {e:#}");
+                        }
+                    }
+                }
+                Some(Arc::new(rt))
+            }
             Err(e) => {
                 log::error!("audio passthrough disabled: {e:#}");
                 None
@@ -178,6 +208,18 @@ fn main() -> Result<()> {
         log::info!("serving MJPEG at http://{}/", addr);
     }
 
+    // Background saver: snapshots the live state into a Config every second
+    // and writes to disk when something changed. Keeps the UI thread free of
+    // any TOML serialization or file IO.
+    spawn_config_saver(
+        shared_settings.clone(),
+        capture_ctrl.clone(),
+        audio_runtime.as_ref().map(|rt| rt.state.clone()),
+    );
+
+    let metrics = perf::PerfMetrics::new();
+    perf::spawn_sampler(metrics.clone());
+
     match event_loop {
         None => {
             log::info!("headless mode, no preview window. Press Ctrl C to exit.");
@@ -192,6 +234,7 @@ fn main() -> Result<()> {
             capture_info,
             audio_runtime.clone(),
             capture_ctrl,
+            metrics,
         )?,
     }
 
@@ -199,4 +242,63 @@ fn main() -> Result<()> {
     drop(audio_runtime);
 
     Ok(())
+}
+
+fn spawn_config_saver(
+    settings: Arc<Mutex<settings::Settings>>,
+    capture: Arc<capture::CaptureController>,
+    audio: Option<Arc<audio::AudioState>>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("config-saver".into())
+        .spawn(move || {
+            let mut last_saved: Option<config::Config> = None;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let cap_state = capture.state.current.lock().clone();
+                let capture_cfg = config::CaptureConfig {
+                    device_index: Some(capture.last_device_index()),
+                    width: cap_state.as_ref().map(|c| c.resolution().width()),
+                    height: cap_state.as_ref().map(|c| c.resolution().height()),
+                    fps: cap_state.as_ref().map(|c| c.frame_rate()),
+                };
+                let audio_cfg = match audio.as_ref() {
+                    Some(s) => config::AudioConfig {
+                        enabled: true,
+                        input_device: Some(s.input_name()),
+                        output_device: Some(s.output_name()),
+                        volume_percent: s.volume(),
+                        muted: s.is_muted(),
+                        delay_ms: s.delay_ms(),
+                    },
+                    None => config::AudioConfig {
+                        enabled: false,
+                        ..config::AudioConfig::default()
+                    },
+                };
+                let snapshot = {
+                    let s = settings.lock();
+                    config::config_from_runtime(&s, &capture_cfg, &audio_cfg)
+                };
+                let changed = match &last_saved {
+                    Some(prev) => !configs_equivalent(prev, &snapshot),
+                    None => true,
+                };
+                if changed {
+                    if let Err(e) = config::save(&snapshot) {
+                        log::warn!("config save failed: {e:#}");
+                    } else {
+                        log::debug!("config saved");
+                    }
+                    last_saved = Some(snapshot);
+                }
+            }
+        });
+}
+
+/// Equality check that ignores fields we never want to trigger a save just on
+/// their own (none currently, but a hook for the future).
+fn configs_equivalent(a: &config::Config, b: &config::Config) -> bool {
+    let serialise = |c: &config::Config| toml::to_string(c).unwrap_or_default();
+    serialise(a) == serialise(b)
 }

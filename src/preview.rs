@@ -1,5 +1,7 @@
 use crate::audio::AudioRuntime;
 use crate::capture::{CaptureController, CaptureRequest};
+use crate::i18n::{self, Language};
+use crate::perf::PerfMetrics;
 use crate::frame::{Frame, SharedFrame, UiEvent};
 use crate::settings::{CaptureInfo, FitMode, Settings};
 use anyhow::{Context, Result, anyhow};
@@ -29,6 +31,7 @@ pub fn run(
     capture_info: CaptureInfo,
     audio: Option<Arc<AudioRuntime>>,
     capture: Arc<CaptureController>,
+    metrics: Arc<PerfMetrics>,
 ) -> Result<()> {
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
@@ -37,6 +40,7 @@ pub fn run(
         capture_info,
         audio,
         capture,
+        metrics,
         gpu: None,
         last_seq: 0,
         last_log: Instant::now(),
@@ -56,6 +60,7 @@ struct App {
     capture_info: CaptureInfo,
     audio: Option<Arc<AudioRuntime>>,
     capture: Arc<CaptureController>,
+    metrics: Arc<PerfMetrics>,
     gpu: Option<Gpu>,
     last_seq: u64,
     last_log: Instant,
@@ -269,6 +274,7 @@ impl ApplicationHandler<UiEvent> for App {
                     self.audio.as_ref(),
                     &self.capture,
                     &mut pending,
+                    &self.metrics,
                 ) {
                     log::warn!("render: {e:#}");
                 }
@@ -430,6 +436,7 @@ async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
     });
 
     let egui_ctx = egui::Context::default();
+    install_cjk_fallback(&egui_ctx);
     let egui_state = egui_winit::State::new(
         egui_ctx.clone(),
         egui_ctx.viewport_id(),
@@ -535,6 +542,7 @@ fn render_frame(
     audio: Option<&Arc<AudioRuntime>>,
     capture: &Arc<CaptureController>,
     pending: &mut Option<PendingCapture>,
+    metrics: &Arc<PerfMetrics>,
 ) -> Result<()> {
     // Update vertex buffer for current fit mode.
     let (qx, qy) = quad_scale(
@@ -560,7 +568,7 @@ fn render_frame(
     // Build the egui UI.
     let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
     let full_output = gpu.egui_ctx.run(raw_input, |ctx| {
-        build_ui(ctx, settings, capture_info, preview_fps, audio, capture, pending);
+        build_ui(ctx, settings, capture_info, preview_fps, audio, capture, pending, metrics);
     });
     gpu.egui_state
         .handle_platform_output(&gpu.window, full_output.platform_output);
@@ -637,7 +645,10 @@ fn build_ui(
     audio: Option<&Arc<AudioRuntime>>,
     capture: &Arc<CaptureController>,
     pending: &mut Option<PendingCapture>,
+    metrics: &Arc<PerfMetrics>,
 ) {
+    let t = i18n::strings(settings.language);
+
     if settings.show_stats {
         egui::Area::new(egui::Id::new("stats"))
             .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
@@ -648,263 +659,313 @@ fn build_ui(
                         ui.colored_label(
                             egui::Color32::WHITE,
                             format!(
-                                "Ziel {} fps  {}",
-                                capture_info.fps_target, capture_info.format_label
+                                "{} {} fps  {}",
+                                t.stats_target,
+                                capture_info.fps_target,
+                                capture_info.format_label
                             ),
                         );
                         ui.colored_label(
                             egui::Color32::WHITE,
-                            format!("Vorschau {:.1} fps", preview_fps),
+                            format!("{} {:.1} fps", t.stats_preview, preview_fps),
                         );
                         ui.colored_label(
                             egui::Color32::from_rgb(200, 200, 200),
-                            "F1 für Einstellungen",
+                            t.stats_hint,
                         );
                     });
             });
     }
 
     if settings.show_panel {
-        egui::Window::new("Einstellungen")
+        egui::Window::new(t.window_settings)
             .default_pos(egui::pos2(20.0, 80.0))
             .resizable(false)
             .collapsible(true)
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "Ziel: {} fps  {}",
-                    capture_info.fps_target, capture_info.format_label
-                ));
-                ui.separator();
-                ui.label("Monitor-Modus");
-                ui.checkbox(&mut settings.fullscreen, "Vollbild  (F11 / Esc)");
-                ui.checkbox(&mut settings.borderless, "Rahmenlos");
-                ui.checkbox(&mut settings.always_on_top, "Immer im Vordergrund");
-                ui.checkbox(&mut settings.hide_cursor, "Mauszeiger im Vollbild verstecken");
+                egui::CollapsingHeader::new(t.section_language)
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        egui::ComboBox::from_id_salt("language")
+                            .selected_text(settings.language.label_native())
+                            .show_ui(ui, |ui| {
+                                for lang in Language::all() {
+                                    ui.selectable_value(
+                                        &mut settings.language,
+                                        lang,
+                                        lang.label_native(),
+                                    );
+                                }
+                            });
+                    });
+
+                egui::CollapsingHeader::new(t.section_monitor)
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.checkbox(&mut settings.fullscreen, t.fullscreen);
+                        ui.checkbox(&mut settings.borderless, t.borderless);
+                        ui.checkbox(&mut settings.always_on_top, t.always_on_top);
+                        ui.checkbox(&mut settings.hide_cursor, t.hide_cursor);
+                    });
+
+                egui::CollapsingHeader::new(t.section_display)
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        egui::ComboBox::from_label(t.fit_mode)
+                            .selected_text(match settings.fit_mode {
+                                FitMode::Stretch => t.fit_stretch,
+                                FitMode::Fit => t.fit_fit,
+                                FitMode::Fill => t.fit_fill,
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut settings.fit_mode, FitMode::Stretch, t.fit_stretch);
+                                ui.selectable_value(&mut settings.fit_mode, FitMode::Fit, t.fit_fit);
+                                ui.selectable_value(&mut settings.fit_mode, FitMode::Fill, t.fit_fill);
+                            });
+                        ui.checkbox(&mut settings.show_stats, t.show_stats);
+                        ui.horizontal(|ui| {
+                            ui.label(t.background);
+                            ui.color_edit_button_rgb(&mut settings.background_color);
+                        });
+                    });
+
+                egui::CollapsingHeader::new(t.section_capture)
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        capture_section(ui, &t, capture, pending);
+                    });
+
+                egui::CollapsingHeader::new(t.section_audio)
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        audio_section(ui, &t, audio);
+                    });
+
+                egui::CollapsingHeader::new(t.section_relay)
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut settings.jpeg_quality, 1..=100)
+                                .text(t.jpeg_quality),
+                        );
+                    });
+
+                egui::CollapsingHeader::new(t.section_performance)
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        let sys = metrics.system();
+                        ui.label(format!(
+                            "{} {:>5.1} %   {} {} MB",
+                            t.perf_app_cpu,
+                            metrics.cpu_percent(),
+                            t.perf_app_ram,
+                            metrics.memory_mb()
+                        ));
+                        ui.label(format!(
+                            "{} {:>5.1} %   {} {} / {} MB",
+                            t.perf_system_cpu,
+                            sys.total_cpu_percent,
+                            t.perf_system_ram,
+                            sys.used_memory_mb,
+                            sys.total_memory_mb
+                        ));
+                        ui.label(format!("{} {:.1} fps", t.perf_preview, preview_fps));
+                    });
 
                 ui.separator();
-                ui.label("Anzeige");
-                egui::ComboBox::from_label("Bildanpassung")
-                    .selected_text(match settings.fit_mode {
-                        FitMode::Stretch => "Strecken",
-                        FitMode::Fit => "Einpassen (Letterbox)",
-                        FitMode::Fill => "Füllen (zuschneiden)",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut settings.fit_mode, FitMode::Stretch, "Strecken");
-                        ui.selectable_value(&mut settings.fit_mode, FitMode::Fit, "Einpassen (Letterbox)");
-                        ui.selectable_value(&mut settings.fit_mode, FitMode::Fill, "Füllen (zuschneiden)");
-                    });
-                ui.checkbox(&mut settings.show_stats, "Statistik-Overlay zeigen");
-                ui.horizontal(|ui| {
-                    ui.label("Hintergrund");
-                    ui.color_edit_button_rgb(&mut settings.background_color);
-                });
-                ui.separator();
-                ui.label("Relay");
-                ui.add(
-                    egui::Slider::new(&mut settings.jpeg_quality, 1..=100)
-                        .text("JPEG-Qualität"),
+                ui.colored_label(
+                    egui::Color32::from_rgb(180, 180, 180),
+                    t.footer_note,
                 );
-
-                if let Some(rt) = audio {
-                    ui.separator();
-                    ui.label("Audio");
-                    let state = &rt.state;
-                    let in_name = state.input_name();
-                    let out_name = state.output_name();
-                    ui.label(format!(
-                        "{} Hz, {} Kanäle, gepuffert {} ms",
-                        state.sample_rate(),
-                        state.channels(),
-                        state.buffered_ms()
-                    ));
-
-                    ui.horizontal(|ui| {
-                        ui.label("Eingang ");
-                        let mut chosen = in_name.clone();
-                        egui::ComboBox::from_id_salt("audio_in")
-                            .selected_text(short(&chosen))
-                            .show_ui(ui, |ui| {
-                                for name in crate::audio::list_input_devices() {
-                                    ui.selectable_value(&mut chosen, name.clone(), short(&name));
-                                }
-                            });
-                        if chosen != in_name {
-                            if let Err(e) = rt.set_input(&chosen) {
-                                log::warn!("input switch failed: {e:#}");
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Ausgang");
-                        let mut chosen = out_name.clone();
-                        egui::ComboBox::from_id_salt("audio_out")
-                            .selected_text(short(&chosen))
-                            .show_ui(ui, |ui| {
-                                for name in crate::audio::list_output_devices() {
-                                    ui.selectable_value(&mut chosen, name.clone(), short(&name));
-                                }
-                            });
-                        if chosen != out_name {
-                            if let Err(e) = rt.set_output(&chosen) {
-                                log::warn!("output switch failed: {e:#}");
-                            }
-                        }
-                    });
-
-                    let mut volume = state.volume();
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut volume, 0..=200)
-                                .text("Lautstärke (%)")
-                                .integer(),
-                        )
-                        .changed()
-                    {
-                        state.set_volume(volume);
-                    }
-                    let mut muted = state.is_muted();
-                    if ui.checkbox(&mut muted, "Stumm").changed() {
-                        state.set_muted(muted);
-                    }
-                    let mut delay = state.delay_ms();
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut delay, 0..=500)
-                                .text("Sync-Verzögerung (ms)")
-                                .integer(),
-                        )
-                        .changed()
-                    {
-                        state.set_delay_ms(delay);
-                    }
-                } else {
-                    ui.separator();
-                    ui.colored_label(
-                        egui::Color32::from_rgb(180, 180, 180),
-                        "Audio aus (beim Start --audio mitgeben)",
-                    );
-                }
-
-                ui.separator();
-                ui.label("Capture");
-                let available = capture.state.available.lock().clone();
-                let current = capture.state.current.lock().clone();
-                if let Some(c) = &current {
-                    ui.label(format!(
-                        "aktiv: {}x{} @ {} fps  {:?}",
-                        c.resolution().width(),
-                        c.resolution().height(),
-                        c.frame_rate(),
-                        c.format()
-                    ));
-                }
-
-                if !available.is_empty() {
-                    let mut resolutions: Vec<(u32, u32)> = available
-                        .iter()
-                        .map(|f| (f.resolution().width(), f.resolution().height()))
-                        .collect();
-                    resolutions.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-                    resolutions.dedup();
-
-                    let cur_res = current
-                        .as_ref()
-                        .map(|c| (c.resolution().width(), c.resolution().height()))
-                        .unwrap_or((0, 0));
-                    let cur_fps = current.as_ref().map(|c| c.frame_rate()).unwrap_or(0);
-
-                    let p = pending.get_or_insert(PendingCapture {
-                        width: cur_res.0,
-                        height: cur_res.1,
-                        fps: cur_fps,
-                    });
-
-                    let mut chosen_res = (p.width, p.height);
-                    ui.horizontal(|ui| {
-                        ui.label("Auflösung");
-                        egui::ComboBox::from_id_salt("capture_res")
-                            .selected_text(format!("{}x{}", chosen_res.0, chosen_res.1))
-                            .show_ui(ui, |ui| {
-                                for (w, h) in &resolutions {
-                                    let label = format!("{w}x{h}");
-                                    ui.selectable_value(&mut chosen_res, (*w, *h), label);
-                                }
-                            });
-                    });
-                    p.width = chosen_res.0;
-                    p.height = chosen_res.1;
-
-                    let mut fps_options: Vec<u32> = available
-                        .iter()
-                        .filter(|f| {
-                            f.resolution().width() == p.width
-                                && f.resolution().height() == p.height
-                        })
-                        .map(|f| f.frame_rate())
-                        .collect();
-                    fps_options.sort_by(|a, b| b.cmp(a));
-                    fps_options.dedup();
-                    if !fps_options.contains(&p.fps) {
-                        if let Some(&best) = fps_options.first() {
-                            p.fps = best;
-                        }
-                    }
-                    let mut chosen_fps = p.fps;
-                    ui.horizontal(|ui| {
-                        ui.label("fps      ");
-                        egui::ComboBox::from_id_salt("capture_fps")
-                            .selected_text(format!("{chosen_fps}"))
-                            .show_ui(ui, |ui| {
-                                for f in &fps_options {
-                                    ui.selectable_value(&mut chosen_fps, *f, format!("{f}"));
-                                }
-                            });
-                    });
-                    p.fps = chosen_fps;
-
-                    let dirty = (p.width, p.height) != cur_res || p.fps != cur_fps;
-                    let apply_label = if dirty { "Anwenden" } else { "Übernommen" };
-                    ui.add_enabled_ui(dirty, |ui| {
-                        if ui.button(apply_label).clicked() {
-                            // We don't have direct access to the original CaptureRequest's
-                            // device_index here; the controller already knows. Build a
-                            // new request from the active mode plus the user's choice.
-                            let req = CaptureRequest {
-                                device_index: 0, // overwritten below
-                                width: Some(p.width),
-                                height: Some(p.height),
-                                fps: Some(p.fps),
-                                force_mjpeg: false,
-                            };
-                            // Pull device_index from the currently active CameraInfo via
-                            // the active CameraFormat (nokhwa drops the device idx after
-                            // pick). Approximation: ask the user to keep the same device
-                            // and read from the controller's current active mode.
-                            apply_capture_change(capture, req);
-                        }
-                    });
-                }
-
-                ui.separator();
-                if ui.button("Schließen").clicked() {
+                if ui.button(t.close).clicked() {
                     settings.show_panel = false;
                 }
             });
     }
 }
 
-fn apply_capture_change(capture: &Arc<CaptureController>, mut req: CaptureRequest) {
-    // The CaptureController does not currently keep the device_index on
-    // hand. The panel can only restart with the same device for now, so we
-    // recover it from the original command line argument captured by main
-    // through a static slot. As a pragmatic shortcut we leave device_index
-    // as 0 if unknown; in practice all flows hit a real device because
-    // capture has already been streaming successfully.
-    if req.device_index == 0 {
-        req.device_index = capture.last_device_index();
+fn capture_section(
+    ui: &mut egui::Ui,
+    t: &i18n::Strings,
+    capture: &Arc<CaptureController>,
+    pending: &mut Option<PendingCapture>,
+) {
+    let available = capture.state.available.lock().clone();
+    let current = capture.state.current.lock().clone();
+    if let Some(c) = &current {
+        ui.label(format!(
+            "{}: {}x{} @ {} fps  {:?}",
+            t.capture_active,
+            c.resolution().width(),
+            c.resolution().height(),
+            c.frame_rate(),
+            c.format()
+        ));
     }
-    capture.restart(req);
+    if available.is_empty() {
+        return;
+    }
+
+    let mut resolutions: Vec<(u32, u32)> = available
+        .iter()
+        .map(|f| (f.resolution().width(), f.resolution().height()))
+        .collect();
+    resolutions.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    resolutions.dedup();
+
+    let cur_res = current
+        .as_ref()
+        .map(|c| (c.resolution().width(), c.resolution().height()))
+        .unwrap_or((0, 0));
+    let cur_fps = current.as_ref().map(|c| c.frame_rate()).unwrap_or(0);
+
+    let p = pending.get_or_insert(PendingCapture {
+        width: cur_res.0,
+        height: cur_res.1,
+        fps: cur_fps,
+    });
+
+    let mut chosen_res = (p.width, p.height);
+    ui.horizontal(|ui| {
+        ui.label(t.resolution);
+        egui::ComboBox::from_id_salt("capture_res")
+            .selected_text(format!("{}x{}", chosen_res.0, chosen_res.1))
+            .show_ui(ui, |ui| {
+                for (w, h) in &resolutions {
+                    let label = format!("{w}x{h}");
+                    ui.selectable_value(&mut chosen_res, (*w, *h), label);
+                }
+            });
+    });
+    p.width = chosen_res.0;
+    p.height = chosen_res.1;
+
+    let mut fps_options: Vec<u32> = available
+        .iter()
+        .filter(|f| {
+            f.resolution().width() == p.width && f.resolution().height() == p.height
+        })
+        .map(|f| f.frame_rate())
+        .collect();
+    fps_options.sort_by(|a, b| b.cmp(a));
+    fps_options.dedup();
+    if !fps_options.contains(&p.fps) {
+        if let Some(&best) = fps_options.first() {
+            p.fps = best;
+        }
+    }
+    let mut chosen_fps = p.fps;
+    ui.horizontal(|ui| {
+        ui.label(t.fps);
+        egui::ComboBox::from_id_salt("capture_fps")
+            .selected_text(format!("{chosen_fps}"))
+            .show_ui(ui, |ui| {
+                for f in &fps_options {
+                    ui.selectable_value(&mut chosen_fps, *f, format!("{f}"));
+                }
+            });
+    });
+    p.fps = chosen_fps;
+
+    let dirty = (p.width, p.height) != cur_res || p.fps != cur_fps;
+    let apply_label = if dirty { t.apply } else { t.applied };
+    ui.add_enabled_ui(dirty, |ui| {
+        if ui.button(apply_label).clicked() {
+            let req = CaptureRequest {
+                device_index: capture.last_device_index(),
+                width: Some(p.width),
+                height: Some(p.height),
+                fps: Some(p.fps),
+                force_mjpeg: false,
+            };
+            capture.restart(req);
+        }
+    });
+}
+
+fn audio_section(
+    ui: &mut egui::Ui,
+    t: &i18n::Strings,
+    audio: Option<&Arc<AudioRuntime>>,
+) {
+    let Some(rt) = audio else {
+        ui.colored_label(
+            egui::Color32::from_rgb(180, 180, 180),
+            t.audio_off_hint,
+        );
+        return;
+    };
+    let state = &rt.state;
+    let in_name = state.input_name();
+    let out_name = state.output_name();
+    ui.label(format!(
+        "{} Hz, {} {}, {} {} ms",
+        state.sample_rate(),
+        state.channels(),
+        t.audio_status_channels,
+        t.audio_status_buffered,
+        state.buffered_ms()
+    ));
+
+    ui.horizontal(|ui| {
+        ui.label(t.audio_in);
+        let mut chosen = in_name.clone();
+        egui::ComboBox::from_id_salt("audio_in")
+            .selected_text(short(&chosen))
+            .show_ui(ui, |ui| {
+                for name in crate::audio::list_input_devices() {
+                    ui.selectable_value(&mut chosen, name.clone(), short(&name));
+                }
+            });
+        if chosen != in_name {
+            if let Err(e) = rt.set_input(&chosen) {
+                log::warn!("input switch failed: {e:#}");
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label(t.audio_out);
+        let mut chosen = out_name.clone();
+        egui::ComboBox::from_id_salt("audio_out")
+            .selected_text(short(&chosen))
+            .show_ui(ui, |ui| {
+                for name in crate::audio::list_output_devices() {
+                    ui.selectable_value(&mut chosen, name.clone(), short(&name));
+                }
+            });
+        if chosen != out_name {
+            if let Err(e) = rt.set_output(&chosen) {
+                log::warn!("output switch failed: {e:#}");
+            }
+        }
+    });
+
+    let mut volume = state.volume();
+    if ui
+        .add(
+            egui::Slider::new(&mut volume, 0..=200)
+                .text(t.volume)
+                .integer(),
+        )
+        .changed()
+    {
+        state.set_volume(volume);
+    }
+    let mut muted = state.is_muted();
+    if ui.checkbox(&mut muted, t.muted).changed() {
+        state.set_muted(muted);
+    }
+    let mut delay = state.delay_ms();
+    if ui
+        .add(
+            egui::Slider::new(&mut delay, 0..=500)
+                .text(t.sync_delay)
+                .integer(),
+        )
+        .changed()
+    {
+        state.set_delay_ms(delay);
+    }
 }
 
 /// Returns the quad scale (x, y) in clip space for the chosen fit mode given
@@ -927,6 +988,43 @@ fn quad_scale(mode: FitMode, src_aspect: f32, dst_aspect: f32) -> (f32, f32) {
             }
         }
     }
+}
+
+/// Try to register a CJK font with egui so Chinese / Japanese / Korean
+/// glyphs render. Looks for Microsoft YaHei on Windows first, falls back to
+/// other common system fonts. If none are found Chinese text shows as boxes,
+/// which is recoverable by switching the language back.
+fn install_cjk_fallback(ctx: &egui::Context) {
+    let candidates = [
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\msyh.ttf",
+        r"C:\Windows\Fonts\msyhbd.ttc",
+        r"C:\Windows\Fonts\simsun.ttc",
+    ];
+    let mut font_bytes: Option<Vec<u8>> = None;
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            log::info!("CJK fallback font loaded from {path}");
+            font_bytes = Some(bytes);
+            break;
+        }
+    }
+    let Some(bytes) = font_bytes else {
+        log::warn!("no CJK system font found; Chinese text will render as boxes");
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "cjk-fallback".into(),
+        egui::FontData::from_owned(bytes).into(),
+    );
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.push("cjk-fallback".into());
+    }
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+        family.push("cjk-fallback".into());
+    }
+    ctx.set_fonts(fonts);
 }
 
 fn apply_window_mode(window: &Window, settings: &Settings, applied: &mut AppliedWindow) {

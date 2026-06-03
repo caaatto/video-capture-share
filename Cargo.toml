@@ -18,12 +18,16 @@ bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 cpal = "0.15"
 dialoguer = { version = "0.11", default-features = false }
+directories = "5"
 egui = "0.30"
 egui-wgpu = "0.30"
 egui-winit = { version = "0.30", default-features = false, features = ["links"] }
 nokhwa = { version = "0.10", features = ["input-msmf", "input-native"] }
 pollster = "0.4"
 ringbuf = "0.4"
+serde = { version = "1", features = ["derive"] }
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+toml = "0.8"
 wgpu = "23"
 winit = "0.30"
 tiny_http = "0.12"

@@ -1,0 +1,226 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Language {
+    German,
+    English,
+    SimplifiedChinese,
+}
+
+impl Default for Language {
+    fn default() -> Self {
+        Language::German
+    }
+}
+
+impl Language {
+    pub fn all() -> [Language; 3] {
+        [Language::German, Language::English, Language::SimplifiedChinese]
+    }
+
+    pub fn label_native(self) -> &'static str {
+        match self {
+            Language::German => "Deutsch",
+            Language::English => "English",
+            Language::SimplifiedChinese => "简体中文",
+        }
+    }
+}
+
+/// Every user-facing string in the F1 panel. Labels only; numbers and lists
+/// are formatted inline with `format!` in the panel code. Adding a language
+/// is one struct literal here, no edits in preview.rs.
+pub struct Strings {
+    pub window_settings: &'static str,
+    pub section_language: &'static str,
+    pub section_monitor: &'static str,
+    pub section_display: &'static str,
+    pub section_relay: &'static str,
+    pub section_audio: &'static str,
+    pub section_capture: &'static str,
+    pub section_performance: &'static str,
+
+    pub language: &'static str,
+
+    pub fullscreen: &'static str,
+    pub borderless: &'static str,
+    pub always_on_top: &'static str,
+    pub hide_cursor: &'static str,
+
+    pub fit_mode: &'static str,
+    pub fit_stretch: &'static str,
+    pub fit_fit: &'static str,
+    pub fit_fill: &'static str,
+    pub show_stats: &'static str,
+    pub background: &'static str,
+
+    pub jpeg_quality: &'static str,
+
+    pub audio_in: &'static str,
+    pub audio_out: &'static str,
+    pub audio_status_channels: &'static str,
+    pub audio_status_buffered: &'static str,
+    pub volume: &'static str,
+    pub muted: &'static str,
+    pub sync_delay: &'static str,
+    pub audio_off_hint: &'static str,
+
+    pub capture_active: &'static str,
+    pub resolution: &'static str,
+    pub fps: &'static str,
+    pub apply: &'static str,
+    pub applied: &'static str,
+
+    pub perf_app_cpu: &'static str,
+    pub perf_app_ram: &'static str,
+    pub perf_system_cpu: &'static str,
+    pub perf_system_ram: &'static str,
+    pub perf_preview: &'static str,
+
+    pub footer_note: &'static str,
+    pub close: &'static str,
+
+    pub stats_target: &'static str,
+    pub stats_preview: &'static str,
+    pub stats_hint: &'static str,
+}
+
+pub fn strings(lang: Language) -> Strings {
+    match lang {
+        Language::German => Strings {
+            window_settings: "Einstellungen",
+            section_language: "Sprache",
+            section_monitor: "Monitor-Modus",
+            section_display: "Anzeige",
+            section_relay: "Relay",
+            section_audio: "Audio",
+            section_capture: "Capture",
+            section_performance: "Performance",
+            language: "Sprache",
+            fullscreen: "Vollbild  (F11 / Esc)",
+            borderless: "Rahmenlos",
+            always_on_top: "Immer im Vordergrund",
+            hide_cursor: "Mauszeiger im Vollbild verstecken",
+            fit_mode: "Bildanpassung",
+            fit_stretch: "Strecken",
+            fit_fit: "Einpassen (Letterbox)",
+            fit_fill: "Füllen (zuschneiden)",
+            show_stats: "Statistik-Overlay zeigen",
+            background: "Hintergrund",
+            jpeg_quality: "JPEG-Qualität",
+            audio_in: "Eingang",
+            audio_out: "Ausgang",
+            audio_status_channels: "Kanäle",
+            audio_status_buffered: "gepuffert",
+            volume: "Lautstärke (%)",
+            muted: "Stumm",
+            sync_delay: "Sync-Verzögerung (ms)",
+            audio_off_hint: "Audio aus (beim Start --audio mitgeben)",
+            capture_active: "aktiv",
+            resolution: "Auflösung",
+            fps: "fps",
+            apply: "Anwenden",
+            applied: "Übernommen",
+            perf_app_cpu: "vicash CPU",
+            perf_app_ram: "RAM",
+            perf_system_cpu: "System CPU",
+            perf_system_ram: "RAM",
+            perf_preview: "Vorschau",
+            footer_note: "Gerät, Auflösung und fps gelten ab dem nächsten Start",
+            close: "Schließen",
+            stats_target: "Ziel",
+            stats_preview: "Vorschau",
+            stats_hint: "F1 für Einstellungen",
+        },
+        Language::English => Strings {
+            window_settings: "Settings",
+            section_language: "Language",
+            section_monitor: "Monitor mode",
+            section_display: "Display",
+            section_relay: "Relay",
+            section_audio: "Audio",
+            section_capture: "Capture",
+            section_performance: "Performance",
+            language: "Language",
+            fullscreen: "Fullscreen  (F11 / Esc)",
+            borderless: "Borderless",
+            always_on_top: "Always on top",
+            hide_cursor: "Hide cursor in fullscreen",
+            fit_mode: "Fit mode",
+            fit_stretch: "Stretch",
+            fit_fit: "Fit (letterbox)",
+            fit_fill: "Fill (crop)",
+            show_stats: "Show stats overlay",
+            background: "Background",
+            jpeg_quality: "JPEG quality",
+            audio_in: "In",
+            audio_out: "Out",
+            audio_status_channels: "channels",
+            audio_status_buffered: "buffered",
+            volume: "Volume (%)",
+            muted: "Mute",
+            sync_delay: "Sync delay (ms)",
+            audio_off_hint: "Audio off (pass --audio at launch to enable)",
+            capture_active: "active",
+            resolution: "Resolution",
+            fps: "fps",
+            apply: "Apply",
+            applied: "Applied",
+            perf_app_cpu: "vicash CPU",
+            perf_app_ram: "RAM",
+            perf_system_cpu: "System CPU",
+            perf_system_ram: "RAM",
+            perf_preview: "Preview",
+            footer_note: "Device, resolution and fps take effect on next launch",
+            close: "Close",
+            stats_target: "Target",
+            stats_preview: "Preview",
+            stats_hint: "F1 for settings",
+        },
+        Language::SimplifiedChinese => Strings {
+            window_settings: "设置",
+            section_language: "语言",
+            section_monitor: "显示器模式",
+            section_display: "显示",
+            section_relay: "转发",
+            section_audio: "音频",
+            section_capture: "采集",
+            section_performance: "性能",
+            language: "语言",
+            fullscreen: "全屏  (F11 / Esc)",
+            borderless: "无边框",
+            always_on_top: "总在最前",
+            hide_cursor: "全屏时隐藏鼠标",
+            fit_mode: "适配方式",
+            fit_stretch: "拉伸",
+            fit_fit: "适配 (黑边)",
+            fit_fill: "填充 (裁剪)",
+            show_stats: "显示状态叠加",
+            background: "背景",
+            jpeg_quality: "JPEG 质量",
+            audio_in: "输入",
+            audio_out: "输出",
+            audio_status_channels: "声道",
+            audio_status_buffered: "缓冲",
+            volume: "音量 (%)",
+            muted: "静音",
+            sync_delay: "同步延迟 (ms)",
+            audio_off_hint: "音频已关闭 (启动时加 --audio)",
+            capture_active: "当前",
+            resolution: "分辨率",
+            fps: "fps",
+            apply: "应用",
+            applied: "已应用",
+            perf_app_cpu: "vicash CPU",
+            perf_app_ram: "内存",
+            perf_system_cpu: "系统 CPU",
+            perf_system_ram: "内存",
+            perf_preview: "预览",
+            footer_note: "设备、分辨率和 fps 在下次启动生效",
+            close: "关闭",
+            stats_target: "目标",
+            stats_preview: "预览",
+            stats_hint: "F1 打开设置",
+        },
+    }
+}
