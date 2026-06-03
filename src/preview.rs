@@ -1,4 +1,5 @@
 use crate::audio::AudioRuntime;
+use crate::capture::{CaptureController, CaptureRequest};
 use crate::frame::{Frame, SharedFrame, UiEvent};
 use crate::settings::{CaptureInfo, FitMode, Settings};
 use anyhow::{Context, Result, anyhow};
@@ -27,6 +28,7 @@ pub fn run(
     settings: Arc<Mutex<Settings>>,
     capture_info: CaptureInfo,
     audio: Option<Arc<AudioRuntime>>,
+    capture: Arc<CaptureController>,
 ) -> Result<()> {
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
@@ -34,12 +36,14 @@ pub fn run(
         settings,
         capture_info,
         audio,
+        capture,
         gpu: None,
         last_seq: 0,
         last_log: Instant::now(),
         frames_since_log: 0,
         preview_fps: 0.0,
         tex_size: (0, 0),
+        pending_capture: None,
     };
     event_loop.run_app(&mut app).context("event loop exited with error")?;
     Ok(())
@@ -50,12 +54,22 @@ struct App {
     settings: Arc<Mutex<Settings>>,
     capture_info: CaptureInfo,
     audio: Option<Arc<AudioRuntime>>,
+    capture: Arc<CaptureController>,
     gpu: Option<Gpu>,
     last_seq: u64,
     last_log: Instant,
     frames_since_log: u64,
     preview_fps: f32,
     tex_size: (u32, u32),
+    /// Resolution / fps the user is staging in the F1 panel before Apply.
+    pending_capture: Option<PendingCapture>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingCapture {
+    width: u32,
+    height: u32,
+    fps: u32,
 }
 
 struct Gpu {
@@ -203,6 +217,7 @@ impl ApplicationHandler<UiEvent> for App {
                     }
                 }
                 let mut settings = self.settings.lock().clone();
+                let mut pending = self.pending_capture;
                 if let Err(e) = render_frame(
                     gpu,
                     &mut settings,
@@ -210,11 +225,14 @@ impl ApplicationHandler<UiEvent> for App {
                     self.preview_fps,
                     self.tex_size,
                     self.audio.as_ref(),
+                    &self.capture,
+                    &mut pending,
                 ) {
                     log::warn!("render: {e:#}");
                 }
                 // Write back any settings the user changed in the panel.
                 *self.settings.lock() = settings;
+                self.pending_capture = pending;
 
                 tick_fps_log(&mut self.last_log, &mut self.frames_since_log, &mut self.preview_fps);
             }
@@ -473,6 +491,8 @@ fn render_frame(
     preview_fps: f32,
     tex_size: (u32, u32),
     audio: Option<&Arc<AudioRuntime>>,
+    capture: &Arc<CaptureController>,
+    pending: &mut Option<PendingCapture>,
 ) -> Result<()> {
     // Update vertex buffer for current fit mode.
     let (qx, qy) = quad_scale(
@@ -498,7 +518,7 @@ fn render_frame(
     // Build the egui UI.
     let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
     let full_output = gpu.egui_ctx.run(raw_input, |ctx| {
-        build_ui(ctx, settings, capture_info, preview_fps, audio);
+        build_ui(ctx, settings, capture_info, preview_fps, audio, capture, pending);
     });
     gpu.egui_state
         .handle_platform_output(&gpu.window, full_output.platform_output);
@@ -573,6 +593,8 @@ fn build_ui(
     capture_info: &CaptureInfo,
     preview_fps: f32,
     audio: Option<&Arc<AudioRuntime>>,
+    capture: &Arc<CaptureController>,
+    pending: &mut Option<PendingCapture>,
 ) {
     if settings.show_stats {
         egui::Area::new(egui::Id::new("stats"))
@@ -716,15 +738,124 @@ fn build_ui(
                 }
 
                 ui.separator();
-                ui.colored_label(
-                    egui::Color32::from_rgb(180, 180, 180),
-                    "Gerät, Auflösung und fps gelten ab dem nächsten Start",
-                );
+                ui.label("Capture");
+                let available = capture.state.available.lock().clone();
+                let current = capture.state.current.lock().clone();
+                if let Some(c) = &current {
+                    ui.label(format!(
+                        "aktiv: {}x{} @ {} fps  {:?}",
+                        c.resolution().width(),
+                        c.resolution().height(),
+                        c.frame_rate(),
+                        c.format()
+                    ));
+                }
+
+                if !available.is_empty() {
+                    let mut resolutions: Vec<(u32, u32)> = available
+                        .iter()
+                        .map(|f| (f.resolution().width(), f.resolution().height()))
+                        .collect();
+                    resolutions.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+                    resolutions.dedup();
+
+                    let cur_res = current
+                        .as_ref()
+                        .map(|c| (c.resolution().width(), c.resolution().height()))
+                        .unwrap_or((0, 0));
+                    let cur_fps = current.as_ref().map(|c| c.frame_rate()).unwrap_or(0);
+
+                    let p = pending.get_or_insert(PendingCapture {
+                        width: cur_res.0,
+                        height: cur_res.1,
+                        fps: cur_fps,
+                    });
+
+                    let mut chosen_res = (p.width, p.height);
+                    ui.horizontal(|ui| {
+                        ui.label("Auflösung");
+                        egui::ComboBox::from_id_salt("capture_res")
+                            .selected_text(format!("{}x{}", chosen_res.0, chosen_res.1))
+                            .show_ui(ui, |ui| {
+                                for (w, h) in &resolutions {
+                                    let label = format!("{w}x{h}");
+                                    ui.selectable_value(&mut chosen_res, (*w, *h), label);
+                                }
+                            });
+                    });
+                    p.width = chosen_res.0;
+                    p.height = chosen_res.1;
+
+                    let mut fps_options: Vec<u32> = available
+                        .iter()
+                        .filter(|f| {
+                            f.resolution().width() == p.width
+                                && f.resolution().height() == p.height
+                        })
+                        .map(|f| f.frame_rate())
+                        .collect();
+                    fps_options.sort_by(|a, b| b.cmp(a));
+                    fps_options.dedup();
+                    if !fps_options.contains(&p.fps) {
+                        if let Some(&best) = fps_options.first() {
+                            p.fps = best;
+                        }
+                    }
+                    let mut chosen_fps = p.fps;
+                    ui.horizontal(|ui| {
+                        ui.label("fps      ");
+                        egui::ComboBox::from_id_salt("capture_fps")
+                            .selected_text(format!("{chosen_fps}"))
+                            .show_ui(ui, |ui| {
+                                for f in &fps_options {
+                                    ui.selectable_value(&mut chosen_fps, *f, format!("{f}"));
+                                }
+                            });
+                    });
+                    p.fps = chosen_fps;
+
+                    let dirty = (p.width, p.height) != cur_res || p.fps != cur_fps;
+                    let apply_label = if dirty { "Anwenden" } else { "Übernommen" };
+                    ui.add_enabled_ui(dirty, |ui| {
+                        if ui.button(apply_label).clicked() {
+                            // We don't have direct access to the original CaptureRequest's
+                            // device_index here; the controller already knows. Build a
+                            // new request from the active mode plus the user's choice.
+                            let req = CaptureRequest {
+                                device_index: 0, // overwritten below
+                                width: Some(p.width),
+                                height: Some(p.height),
+                                fps: Some(p.fps),
+                                force_mjpeg: false,
+                            };
+                            // Pull device_index from the currently active CameraInfo via
+                            // the active CameraFormat (nokhwa drops the device idx after
+                            // pick). Approximation: ask the user to keep the same device
+                            // and read from the controller's current active mode.
+                            apply_capture_change(capture, req);
+                        }
+                    });
+                }
+
+                ui.separator();
                 if ui.button("Schließen").clicked() {
                     settings.show_panel = false;
                 }
             });
     }
+}
+
+fn apply_capture_change(capture: &Arc<CaptureController>, mut req: CaptureRequest) {
+    // The CaptureController does not currently keep the device_index on
+    // hand. The panel can only restart with the same device for now, so we
+    // recover it from the original command line argument captured by main
+    // through a static slot. As a pragmatic shortcut we leave device_index
+    // as 0 if unknown; in practice all flows hit a real device because
+    // capture has already been streaming successfully.
+    if req.device_index == 0 {
+        req.device_index = capture.last_device_index();
+    }
+    capture.restart(req);
 }
 
 /// Returns the quad scale (x, y) in clip space for the chosen fit mode given

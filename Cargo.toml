@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["caaatto"]
 license = "MIT"
 description = "vicash: low overhead capture card preview and LAN relay for streamers"
-repository = "https://github.com/caaatto/video-capture-share"
+repository = "https://github.com/caaatto/vicash"
 build = "build.rs"
 
 [[bin]]

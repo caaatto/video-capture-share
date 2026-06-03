@@ -6,7 +6,9 @@ use nokhwa::utils::{
     RequestedFormatType, Resolution,
 };
 use nokhwa::{Camera, query};
+use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use winit::event_loop::EventLoopProxy;
@@ -102,30 +104,93 @@ pub fn probe(device_index: u32) -> Result<()> {
     Ok(())
 }
 
+/// Snapshot of what the capture thread knows about the device. The UI reads
+/// it to populate dropdowns and to display the active mode.
+pub struct CaptureState {
+    pub available: Mutex<Vec<CameraFormat>>,
+    pub current: Mutex<Option<CameraFormat>>,
+}
+
+impl CaptureState {
+    pub fn new() -> Self {
+        Self {
+            available: Mutex::new(Vec::new()),
+            current: Mutex::new(None),
+        }
+    }
+}
+
+pub enum CaptureCommand {
+    Restart(CaptureRequest),
+}
+
+pub struct CaptureController {
+    pub state: Arc<CaptureState>,
+    cmd_tx: Sender<CaptureCommand>,
+    device_index: u32,
+    _handle: JoinHandle<()>,
+}
+
+impl CaptureController {
+    pub fn restart(&self, req: CaptureRequest) {
+        let _ = self.cmd_tx.send(CaptureCommand::Restart(req));
+    }
+
+    pub fn last_device_index(&self) -> u32 {
+        self.device_index
+    }
+}
+
 pub fn spawn(
     req: CaptureRequest,
     sink: SharedFrame,
     notifier: Option<EventLoopProxy<UiEvent>>,
-) -> Result<JoinHandle<()>> {
+) -> Result<CaptureController> {
+    let state = Arc::new(CaptureState::new());
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let state_for_thread = state.clone();
     let handle = thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
-            if let Err(e) = run(req, sink, notifier) {
+            if let Err(e) = run(req, sink, notifier, state_for_thread, cmd_rx) {
                 log::error!("capture thread exited: {e:#}");
             }
         })?;
-    Ok(handle)
+    Ok(CaptureController { state, cmd_tx, device_index: req.device_index, _handle: handle })
 }
 
 fn run(
-    req: CaptureRequest,
+    initial_req: CaptureRequest,
     sink: SharedFrame,
     notifier: Option<EventLoopProxy<UiEvent>>,
+    state: Arc<CaptureState>,
+    cmd_rx: Receiver<CaptureCommand>,
 ) -> Result<()> {
-    // Open once. MSMF is finicky about rapid open/close, so we keep the same
-    // Camera handle for the format query AND for streaming. Probing then
-    // closing then reopening triggers "Hardware MFT failed to start streaming
-    // due to lack of hardware resources" on most cheap cards.
+    let mut current_req = initial_req;
+    loop {
+        match run_once(&current_req, &sink, notifier.as_ref(), &state, &cmd_rx)? {
+            LoopExit::Restart(new_req) => {
+                current_req = new_req;
+                // MSMF needs a beat between close and reopen on cheap cards.
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            LoopExit::Stop => return Ok(()),
+        }
+    }
+}
+
+enum LoopExit {
+    Restart(CaptureRequest),
+    Stop,
+}
+
+fn run_once(
+    req: &CaptureRequest,
+    sink: &SharedFrame,
+    notifier: Option<&EventLoopProxy<UiEvent>>,
+    state: &Arc<CaptureState>,
+    cmd_rx: &Receiver<CaptureCommand>,
+) -> Result<LoopExit> {
     let placeholder = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
     let index = CameraIndex::Index(req.device_index);
     let mut cam = Camera::new(index, placeholder)
@@ -134,7 +199,8 @@ fn run(
     let formats = cam
         .compatible_camera_formats()
         .context("failed to list compatible formats")?;
-    let chosen = pick_best_format_from(&formats, &req)?;
+    *state.available.lock() = formats.clone();
+    let chosen = pick_best_format_from(&formats, req)?;
     log::info!(
         "selected mode: {}x{} @ {} fps  {:?}",
         chosen.resolution().width(),
@@ -142,6 +208,7 @@ fn run(
         chosen.frame_rate(),
         chosen.format()
     );
+    *state.current.lock() = Some(chosen);
 
     cam.set_camera_requset(RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(chosen)))
         .context("failed to apply chosen capture format")?;
@@ -153,6 +220,23 @@ fn run(
     let mut frames_since_log: u64 = 0;
     let mut last_log = Instant::now();
     loop {
+        // Check for restart / stop before each frame so the thread responds
+        // promptly to the F1 panel without dropping signal in the middle of
+        // a frame read.
+        match cmd_rx.try_recv() {
+            Ok(CaptureCommand::Restart(new_req)) => {
+                log::info!("capture restart requested");
+                let _ = cam.stop_stream();
+                drop(cam);
+                return Ok(LoopExit::Restart(new_req));
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                let _ = cam.stop_stream();
+                return Ok(LoopExit::Stop);
+            }
+        }
+
         let buf = match cam.frame() {
             Ok(b) => b,
             Err(e) => {
@@ -181,9 +265,7 @@ fn run(
         }
         seq = seq.wrapping_add(1);
         sink.publish(Frame { width: w, height: h, rgb: Arc::new(rgb), seq });
-        if let Some(n) = notifier.as_ref() {
-            // If the loop is gone (window closed), the proxy fails; that just
-            // means we're about to exit anyway.
+        if let Some(n) = notifier {
             let _ = n.send_event(UiEvent::FrameReady);
         }
 

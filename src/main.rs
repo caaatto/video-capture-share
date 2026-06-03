@@ -154,8 +154,10 @@ fn main() -> Result<()> {
         (Some(el), Some(proxy))
     };
 
-    let _capture_handle = capture::spawn(request, shared.clone(), notifier)
-        .context("failed to start capture thread")?;
+    let capture_ctrl = Arc::new(
+        capture::spawn(request, shared.clone(), notifier)
+            .context("failed to start capture thread")?
+    );
 
     let audio_runtime = if cli.audio {
         let hint = cli.audio_device.as_deref().or(video_device_name.as_deref());
@@ -183,7 +185,14 @@ fn main() -> Result<()> {
                 std::thread::park();
             }
         }
-        Some(el) => preview::run(el, shared, shared_settings, capture_info, audio_runtime.clone())?,
+        Some(el) => preview::run(
+            el,
+            shared,
+            shared_settings,
+            capture_info,
+            audio_runtime.clone(),
+            capture_ctrl,
+        )?,
     }
 
     // Keep audio alive until the preview exits.
