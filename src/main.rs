@@ -8,6 +8,8 @@ mod audio;
 mod capture;
 mod config;
 mod frame;
+#[cfg(windows)]
+mod h264_encoder;
 mod i18n;
 mod perf;
 mod preview;

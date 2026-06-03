@@ -39,6 +39,13 @@ env_logger = "0.11"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Media"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Media",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_KernelStreaming",
+] }
 
 [features]
 default = []
