@@ -15,7 +15,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::mem::ManuallyDrop;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::*;
-use windows::core::GUID;
+use windows::Win32::System::Variant::*;
+use windows::core::{GUID, Interface};
 
 const MF_VERSION_LOCAL: u32 = 0x0002_0070;
 
@@ -48,6 +49,9 @@ impl MfStartup {
 /// IMFTransform is COM-thread-bound; create and use on the same thread.
 pub struct H264Encoder {
     transform: IMFTransform,
+    /// Same encoder, queried as ICodecAPI for codec-specific runtime knobs
+    /// like force-keyframe and GOP size. None if the MFT does not expose it.
+    codec_api: Option<ICodecAPI>,
     pub width: u32,
     pub height: u32,
     fps_num: u32,
@@ -57,6 +61,12 @@ pub struct H264Encoder {
     /// Annex-B SPS/PPS prefix to prepend to the first IDR. Some MFTs put
     /// them inline already, in which case this is empty.
     pub extra_data: Vec<u8>,
+    /// How many frames between forced keyframes. Re-emitted via
+    /// MFSampleExtension_CleanPoint on the input sample because the MSMF
+    /// software encoder ignores CODECAPI_AVEncMPVGOPSize set on its
+    /// attribute store.
+    keyframe_interval: u32,
+    frames_since_idr: u32,
 }
 
 impl H264Encoder {
@@ -67,6 +77,9 @@ impl H264Encoder {
         MfStartup::ensure()?;
 
         let transform = pick_h264_encoder()?;
+
+        let codec_api: Option<ICodecAPI> = transform.cast().ok();
+        log::info!("ICodecAPI available: {}", codec_api.is_some());
 
         // Output type first: H264, target resolution + fps + bitrate.
         // For most MFTs the output type must be set BEFORE the input type,
@@ -121,6 +134,25 @@ impl H264Encoder {
         let in_stream_id = in_ids[0];
         let out_stream_id = out_ids[0];
 
+        // Codec parameters work AFTER both input and output types are set.
+        if let Some(api) = codec_api.as_ref() {
+            let try_set = |name: &str, key: &GUID, var: &windows::Win32::System::Variant::VARIANT| {
+                let r = unsafe { api.SetValue(key, var) };
+                match r {
+                    Ok(()) => log::info!("ICodecAPI {name}: ok"),
+                    Err(e) => log::warn!("ICodecAPI {name}: {e}"),
+                }
+            };
+            try_set(
+                "AVEncCommonRateControlMode",
+                &CODECAPI_AVEncCommonRateControlMode,
+                &propvar_u32(eAVEncCommonRateControlMode_CBR.0 as u32),
+            );
+            try_set("AVEncCommonMeanBitRate", &CODECAPI_AVEncCommonMeanBitRate, &propvar_u32(bitrate_bps));
+            try_set("AVEncMPVGOPSize", &CODECAPI_AVEncMPVGOPSize, &propvar_u32(fps.max(1)));
+            try_set("AVEncMPVDefaultBPictureCount", &CODECAPI_AVEncMPVDefaultBPictureCount, &propvar_u32(0));
+        }
+
         unsafe {
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
@@ -128,6 +160,7 @@ impl H264Encoder {
 
         Ok(Self {
             transform,
+            codec_api,
             width,
             height,
             fps_num: fps,
@@ -135,6 +168,8 @@ impl H264Encoder {
             in_stream_id,
             out_stream_id,
             extra_data: Vec::new(),
+            keyframe_interval: fps.max(1),
+            frames_since_idr: u32::MAX,
         })
     }
 
@@ -161,9 +196,21 @@ impl H264Encoder {
         unsafe {
             sample.AddBuffer(&buf)?;
             sample.SetSampleTime(timestamp_100ns)?;
-            // Duration in 100ns units = 10_000_000 * den / num.
             let dur = (10_000_000i64 * self.fps_den as i64) / self.fps_num.max(1) as i64;
             sample.SetSampleDuration(dur)?;
+            // Force a fresh IDR every `keyframe_interval` frames so clients
+            // joining mid-stream can sync quickly. ICodecAPI is the only path
+            // that the Microsoft H.264 software encoder actually honours.
+            self.frames_since_idr = self.frames_since_idr.saturating_add(1);
+            if self.frames_since_idr >= self.keyframe_interval {
+                if let Some(api) = self.codec_api.as_ref() {
+                    let _ = api.SetValue(
+                        &CODECAPI_AVEncVideoForceKeyFrame,
+                        &propvar_u32(1),
+                    );
+                }
+                self.frames_since_idr = 0;
+            }
             self.transform
                 .ProcessInput(self.in_stream_id, &sample, 0)
                 .context("ProcessInput")?;
@@ -227,10 +274,11 @@ fn pick_h264_encoder() -> Result<IMFTransform> {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_H264,
     };
-    let flags = MFT_ENUM_FLAG_HARDWARE
-        | MFT_ENUM_FLAG_SYNCMFT
-        | MFT_ENUM_FLAG_ASYNCMFT
-        | MFT_ENUM_FLAG_SORTANDFILTER;
+    // Only sync MFTs. The NVIDIA / Intel hardware encoders register as
+    // async-only and need the IMFMediaEventGenerator pattern, which this
+    // encoder does not implement. Falling back to the Microsoft software
+    // H.264 encoder is slower but correct; an async path can land later.
+    let flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER;
 
     let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count: u32 = 0;
@@ -297,6 +345,35 @@ fn set_ratio(t: &IMFMediaType, key: GUID, num: u32, den: u32) -> Result<()> {
     let packed = ((num as u64) << 32) | (den as u64);
     unsafe { t.SetUINT64(&key, packed)? };
     Ok(())
+}
+
+/// Build a VARIANT carrying a u32 (VT_UI4). ICodecAPI takes its parameter
+/// values through this Win32 tagged-union type. Note that SetValue uses
+/// VARIANT not PROPVARIANT; the field layouts differ slightly.
+fn propvar_u32(v: u32) -> windows::Win32::System::Variant::VARIANT {
+    use windows::Win32::System::Variant::{VARENUM, VARIANT};
+    unsafe {
+        let mut p: VARIANT = std::mem::zeroed();
+        let inner = &mut p.Anonymous.Anonymous;
+        inner.vt = VARENUM(VT_UI4.0);
+        inner.Anonymous.ulVal = v;
+        p
+    }
+}
+
+fn propvar_bool(b: bool) -> windows::Win32::System::Variant::VARIANT {
+    use windows::Win32::System::Variant::{VARENUM, VARIANT};
+    unsafe {
+        let mut p: VARIANT = std::mem::zeroed();
+        let inner = &mut p.Anonymous.Anonymous;
+        inner.vt = VARENUM(VT_BOOL.0);
+        // VARIANT_BOOL is a newtype around i16. -1 = true, 0 = false.
+        // Bit-equivalent to writing the i16 directly; transmute keeps the
+        // dependency on the exact wrapper out of the call sites.
+        let v: i16 = if b { -1 } else { 0 };
+        std::ptr::write(&mut inner.Anonymous.boolVal as *mut _ as *mut i16, v);
+        p
+    }
 }
 
 fn read_sample_bytes(sample: &IMFSample) -> Result<Vec<u8>> {

@@ -17,6 +17,8 @@ mod preview;
 mod relay;
 mod settings;
 mod threadprio;
+#[cfg(windows)]
+mod video_stream;
 
 #[derive(Parser, Debug)]
 #[command(

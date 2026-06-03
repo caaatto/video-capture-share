@@ -42,6 +42,8 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
     "Win32_Media",
     "Win32_Media_MediaFoundation",
     "Win32_Media_KernelStreaming",

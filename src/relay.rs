@@ -1,5 +1,7 @@
 use crate::frame::{FrameData, SharedFrame};
 use crate::settings::Settings;
+#[cfg(windows)]
+use crate::video_stream::{self, TsBroadcaster};
 use anyhow::{Context, Result};
 use image::codecs::jpeg::JpegEncoder;
 use image::{ColorType, ImageEncoder};
@@ -22,8 +24,14 @@ pub struct RelayInfo {
     pub active_clients: AtomicUsize,
     pub total_clients: AtomicUsize,
     /// Flipped to true to ask all relay threads (accept loop, encoder, every
-    /// client streamer) to wind down before their next iteration.
-    pub shutdown: AtomicBool,
+    /// client streamer) to wind down before their next iteration. Wrapped in
+    /// an Arc so we can hand the flag to side threads (the H.264 pipeline)
+    /// without making them depend on RelayInfo itself.
+    pub shutdown: Arc<AtomicBool>,
+    /// Broadcast fan-out for the H.264 over MPEG-TS pipeline. None on
+    /// platforms without an MSMF encoder (anything but Windows for now).
+    #[cfg(windows)]
+    pub ts: Arc<TsBroadcaster>,
 }
 
 impl RelayInfo {
@@ -97,15 +105,30 @@ pub fn spawn(
     let actual = server.server_addr().to_ip().unwrap_or(addr);
     let lan_url = build_lan_url(actual);
     let local_url = format!("http://127.0.0.1:{}", actual.port());
+    #[cfg(windows)]
+    let ts = TsBroadcaster::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
     let info = Arc::new(RelayInfo {
         bind_addr: actual,
         lan_url,
         local_url,
         active_clients: AtomicUsize::new(0),
         total_clients: AtomicUsize::new(0),
-        shutdown: AtomicBool::new(false),
+        shutdown: shutdown.clone(),
+        #[cfg(windows)]
+        ts: ts.clone(),
     });
     let jpeg = Arc::new(SharedJpeg::new());
+
+    // Bring the H.264 + MPEG-TS pipeline up alongside the MJPEG path. On an
+    // NVENC/QSV/AMF capable machine this is basically free; the software
+    // fallback uses real CPU, so users on low-end machines may want to
+    // ignore the /stream.ts endpoint.
+    #[cfg(windows)]
+    {
+        let bitrate = 6_000_000;
+        video_stream::spawn(shared.clone(), ts.clone(), shutdown.clone(), bitrate);
+    }
 
     // One encoder thread per relay; pays the NV12 -> RGB -> JPEG cost once
     // per frame and hands the result out to every connected client unchanged.
@@ -229,11 +252,43 @@ fn handle(
         "/" | "/index.html" => serve_index(request),
         "/stream" | "/stream.mjpg" => serve_mjpeg(request, jpeg, info),
         "/snapshot.jpg" => serve_snapshot(request, jpeg),
+        #[cfg(windows)]
+        "/stream.ts" => serve_mpegts(request, info),
         _ => {
             let _ = request.respond(Response::from_string("not found").with_status_code(404));
             Ok(())
         }
     }
+}
+
+#[cfg(windows)]
+fn serve_mpegts(request: tiny_http::Request, info: Arc<RelayInfo>) -> Result<()> {
+    use std::io::Write as IoWrite;
+    let rx = info.ts.subscribe();
+    let mut writer = request.into_writer();
+    write!(writer, "HTTP/1.1 200 OK\r\n")?;
+    write!(writer, "Content-Type: video/mp2t\r\n")?;
+    write!(writer, "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n")?;
+    write!(writer, "Pragma: no-cache\r\n")?;
+    write!(writer, "Connection: close\r\n")?;
+    write!(writer, "\r\n")?;
+    writer.flush()?;
+
+    info.active_clients.fetch_add(1, Ordering::Relaxed);
+    info.total_clients.fetch_add(1, Ordering::Relaxed);
+    let _guard = ClientGuard(info.clone());
+
+    while !info.shutdown.load(Ordering::Relaxed) {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(chunk) => {
+                writer.write_all(chunk.as_ref())?;
+                writer.flush()?;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok(())
 }
 
 fn serve_index(request: tiny_http::Request) -> Result<()> {
