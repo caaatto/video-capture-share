@@ -1,34 +1,41 @@
 use crate::frame::SharedFrame;
+use crate::settings::Settings;
 use anyhow::{Context, Result};
 use image::codecs::jpeg::JpegEncoder;
 use image::{ColorType, ImageEncoder};
+use parking_lot::Mutex;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tiny_http::{Header, Method, Response, Server};
 
 const BOUNDARY: &str = "vcshareframe";
 
-pub fn spawn(addr: SocketAddr, shared: SharedFrame, quality: u8) -> Result<()> {
+pub fn spawn(
+    addr: SocketAddr,
+    shared: SharedFrame,
+    settings: Arc<Mutex<Settings>>,
+) -> Result<()> {
     let server = Server::http(addr)
         .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
-    let quality = quality.clamp(1, 100);
     std::thread::Builder::new()
         .name("relay-accept".into())
-        .spawn(move || accept_loop(server, shared, quality))
+        .spawn(move || accept_loop(server, shared, settings))
         .context("failed to spawn relay accept thread")?;
     Ok(())
 }
 
-fn accept_loop(server: Server, shared: SharedFrame, quality: u8) {
+fn accept_loop(server: Server, shared: SharedFrame, settings: Arc<Mutex<Settings>>) {
     for request in server.incoming_requests() {
         let shared = shared.clone();
+        let settings = settings.clone();
         let url = request.url().to_string();
         let method = request.method().clone();
         std::thread::Builder::new()
             .name(format!("relay-{}", request.remote_addr().map(|a| a.to_string()).unwrap_or_default()))
             .spawn(move || {
-                if let Err(e) = handle(request, &url, &method, shared, quality) {
+                if let Err(e) = handle(request, &url, &method, shared, settings) {
                     log::debug!("client gone: {e}");
                 }
             })
@@ -41,7 +48,7 @@ fn handle(
     url: &str,
     method: &Method,
     shared: SharedFrame,
-    quality: u8,
+    settings: Arc<Mutex<Settings>>,
 ) -> Result<()> {
     if method != &Method::Get {
         let _ = request.respond(Response::from_string("method not allowed").with_status_code(405));
@@ -49,8 +56,8 @@ fn handle(
     }
     match url {
         "/" | "/index.html" => serve_index(request),
-        "/stream" | "/stream.mjpg" => serve_mjpeg(request, shared, quality),
-        "/snapshot.jpg" => serve_snapshot(request, shared, quality),
+        "/stream" | "/stream.mjpg" => serve_mjpeg(request, shared, settings),
+        "/snapshot.jpg" => serve_snapshot(request, shared, settings),
         _ => {
             let _ = request.respond(Response::from_string("not found").with_status_code(404));
             Ok(())
@@ -71,18 +78,27 @@ fn serve_index(request: tiny_http::Request) -> Result<()> {
     Ok(())
 }
 
-fn serve_snapshot(request: tiny_http::Request, shared: SharedFrame, quality: u8) -> Result<()> {
+fn serve_snapshot(
+    request: tiny_http::Request,
+    shared: SharedFrame,
+    settings: Arc<Mutex<Settings>>,
+) -> Result<()> {
     let Some(frame) = shared.get() else {
         let _ = request.respond(Response::from_string("no frame yet").with_status_code(503));
         return Ok(());
     };
+    let quality = settings.lock().jpeg_quality.clamp(1, 100);
     let jpeg = encode_jpeg(&frame.rgb, frame.width, frame.height, quality)?;
     let header = Header::from_bytes(&b"Content-Type"[..], &b"image/jpeg"[..]).unwrap();
     request.respond(Response::from_data(jpeg).with_header(header))?;
     Ok(())
 }
 
-fn serve_mjpeg(request: tiny_http::Request, shared: SharedFrame, quality: u8) -> Result<()> {
+fn serve_mjpeg(
+    request: tiny_http::Request,
+    shared: SharedFrame,
+    settings: Arc<Mutex<Settings>>,
+) -> Result<()> {
     let mut writer = request.into_writer();
     write!(writer, "HTTP/1.1 200 OK\r\n")?;
     write!(writer, "Content-Type: multipart/x-mixed-replace; boundary={BOUNDARY}\r\n")?;
@@ -102,6 +118,7 @@ fn serve_mjpeg(request: tiny_http::Request, shared: SharedFrame, quality: u8) ->
             }
         };
         last_seq = frame.seq;
+        let quality = settings.lock().jpeg_quality.clamp(1, 100);
         let jpeg = encode_jpeg(&frame.rgb, frame.width, frame.height, quality)?;
         write!(
             writer,

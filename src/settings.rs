@@ -1,0 +1,37 @@
+/// Runtime knobs shown in the F1 settings overlay.
+#[derive(Debug, Clone)]
+pub struct Settings {
+    pub show_panel: bool,
+    pub show_stats: bool,
+    pub fit_mode: FitMode,
+    pub background_color: [f32; 3],
+    pub jpeg_quality: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FitMode {
+    /// Stretch to fill the window, ignoring aspect ratio.
+    Stretch,
+    /// Preserve aspect ratio, letterbox the rest with the background color.
+    Fit,
+    /// Preserve aspect ratio, fill the window, crop the overflow.
+    Fill,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            show_panel: false,
+            show_stats: true,
+            fit_mode: FitMode::Fit,
+            background_color: [0.0, 0.0, 0.0],
+            jpeg_quality: 75,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CaptureInfo {
+    pub fps_target: u32,
+    pub format_label: String,
+}

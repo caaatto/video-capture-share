@@ -12,6 +12,14 @@ pub struct Frame {
     pub seq: u64,
 }
 
+/// Event sent from background threads to wake the winit event loop. Currently
+/// just a "new frame ready" signal; keep it an enum so we can add more (settings
+/// reload, audio device change, etc.) without changing every type signature.
+#[derive(Debug, Clone, Copy)]
+pub enum UiEvent {
+    FrameReady,
+}
+
 /// Latest-frame slot, single producer many consumer. The capture thread overwrites;
 /// readers always see the newest frame, never block the producer, and never queue up.
 #[derive(Clone)]
