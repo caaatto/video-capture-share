@@ -1,3 +1,4 @@
+use crate::audio::AudioRuntime;
 use crate::frame::{Frame, SharedFrame, UiEvent};
 use crate::settings::{CaptureInfo, FitMode, Settings};
 use anyhow::{Context, Result, anyhow};
@@ -23,12 +24,14 @@ pub fn run(
     shared: SharedFrame,
     settings: Arc<Mutex<Settings>>,
     capture_info: CaptureInfo,
+    audio: Option<Arc<AudioRuntime>>,
 ) -> Result<()> {
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
         shared,
         settings,
         capture_info,
+        audio,
         gpu: None,
         last_seq: 0,
         last_log: Instant::now(),
@@ -44,6 +47,7 @@ struct App {
     shared: SharedFrame,
     settings: Arc<Mutex<Settings>>,
     capture_info: CaptureInfo,
+    audio: Option<Arc<AudioRuntime>>,
     gpu: Option<Gpu>,
     last_seq: u64,
     last_log: Instant,
@@ -154,8 +158,9 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(new_size) => {
                 if new_size.width > 0 && new_size.height > 0 {
-                    gpu.config.width = new_size.width;
-                    gpu.config.height = new_size.height;
+                    let max_dim = gpu.device.limits().max_texture_dimension_2d;
+                    gpu.config.width = new_size.width.clamp(1, max_dim);
+                    gpu.config.height = new_size.height.clamp(1, max_dim);
                     gpu.surface.configure(&gpu.device, &gpu.config);
                 }
             }
@@ -181,7 +186,14 @@ impl ApplicationHandler<UiEvent> for App {
                     }
                 }
                 let mut settings = self.settings.lock().clone();
-                if let Err(e) = render_frame(gpu, &mut settings, &self.capture_info, self.preview_fps, self.tex_size) {
+                if let Err(e) = render_frame(
+                    gpu,
+                    &mut settings,
+                    &self.capture_info,
+                    self.preview_fps,
+                    self.tex_size,
+                    self.audio.as_ref(),
+                ) {
                     log::warn!("render: {e:#}");
                 }
                 // Write back any settings the user changed in the panel.
@@ -210,18 +222,21 @@ async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
         })
         .await
         .ok_or_else(|| anyhow!("no suitable GPU adapter"))?;
+    // Use the adapter's full limits so 1080p+ windows do not exceed the
+    // texture cap that downlevel defaults set to 2048.
     let (device, queue) = adapter
         .request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("vcshare-device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,
         )
         .await
         .context("failed to get GPU device")?;
+    let max_dim = device.limits().max_texture_dimension_2d;
 
     let caps = surface.get_capabilities(&adapter);
     let format = caps
@@ -247,8 +262,8 @@ async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format,
-        width: size.width.max(1),
-        height: size.height.max(1),
+        width: size.width.clamp(1, max_dim),
+        height: size.height.clamp(1, max_dim),
         present_mode,
         desired_maximum_frame_latency: 1,
         alpha_mode: caps.alpha_modes[0],
@@ -440,6 +455,7 @@ fn render_frame(
     capture_info: &CaptureInfo,
     preview_fps: f32,
     tex_size: (u32, u32),
+    audio: Option<&Arc<AudioRuntime>>,
 ) -> Result<()> {
     // Update vertex buffer for current fit mode.
     let (qx, qy) = quad_scale(
@@ -465,7 +481,7 @@ fn render_frame(
     // Build the egui UI.
     let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
     let full_output = gpu.egui_ctx.run(raw_input, |ctx| {
-        build_ui(ctx, settings, capture_info, preview_fps);
+        build_ui(ctx, settings, capture_info, preview_fps, audio);
     });
     gpu.egui_state
         .handle_platform_output(&gpu.window, full_output.platform_output);
@@ -539,6 +555,7 @@ fn build_ui(
     settings: &mut Settings,
     capture_info: &CaptureInfo,
     preview_fps: f32,
+    audio: Option<&Arc<AudioRuntime>>,
 ) {
     if settings.show_stats {
         egui::Area::new(egui::Id::new("stats"))
@@ -596,6 +613,87 @@ fn build_ui(
                     egui::Slider::new(&mut settings.jpeg_quality, 1..=100)
                         .text("JPEG quality"),
                 );
+
+                if let Some(rt) = audio {
+                    ui.separator();
+                    ui.label("audio");
+                    let state = &rt.state;
+                    let in_name = state.input_name();
+                    let out_name = state.output_name();
+                    ui.label(format!(
+                        "{} Hz, {} ch, buffered {} ms",
+                        state.sample_rate(),
+                        state.channels(),
+                        state.buffered_ms()
+                    ));
+
+                    ui.horizontal(|ui| {
+                        ui.label("in ");
+                        let mut chosen = in_name.clone();
+                        egui::ComboBox::from_id_salt("audio_in")
+                            .selected_text(short(&chosen))
+                            .show_ui(ui, |ui| {
+                                for name in crate::audio::list_input_devices() {
+                                    ui.selectable_value(&mut chosen, name.clone(), short(&name));
+                                }
+                            });
+                        if chosen != in_name {
+                            if let Err(e) = rt.set_input(&chosen) {
+                                log::warn!("input switch failed: {e:#}");
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("out");
+                        let mut chosen = out_name.clone();
+                        egui::ComboBox::from_id_salt("audio_out")
+                            .selected_text(short(&chosen))
+                            .show_ui(ui, |ui| {
+                                for name in crate::audio::list_output_devices() {
+                                    ui.selectable_value(&mut chosen, name.clone(), short(&name));
+                                }
+                            });
+                        if chosen != out_name {
+                            if let Err(e) = rt.set_output(&chosen) {
+                                log::warn!("output switch failed: {e:#}");
+                            }
+                        }
+                    });
+
+                    let mut volume = state.volume();
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut volume, 0..=200)
+                                .text("volume (%)")
+                                .integer(),
+                        )
+                        .changed()
+                    {
+                        state.set_volume(volume);
+                    }
+                    let mut muted = state.is_muted();
+                    if ui.checkbox(&mut muted, "mute").changed() {
+                        state.set_muted(muted);
+                    }
+                    let mut delay = state.delay_ms();
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut delay, 0..=500)
+                                .text("sync delay (ms)")
+                                .integer(),
+                        )
+                        .changed()
+                    {
+                        state.set_delay_ms(delay);
+                    }
+                } else {
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::from_rgb(180, 180, 180),
+                        "audio off (pass --audio on launch to enable)",
+                    );
+                }
+
                 ui.separator();
                 ui.colored_label(
                     egui::Color32::from_rgb(180, 180, 180),
@@ -627,6 +725,17 @@ fn quad_scale(mode: FitMode, src_aspect: f32, dst_aspect: f32) -> (f32, f32) {
                 (1.0, dst_aspect / src_aspect)
             }
         }
+    }
+}
+
+/// Shorten device names so they fit the dropdown without horizontal scroll.
+fn short(s: &str) -> String {
+    const MAX: usize = 48;
+    if s.len() <= MAX {
+        s.to_string()
+    } else {
+        let head = &s[..MAX.saturating_sub(3)];
+        format!("{head}...")
     }
 }
 

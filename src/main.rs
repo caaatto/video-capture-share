@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+mod audio;
 mod capture;
 mod frame;
 mod preview;
@@ -59,6 +60,26 @@ struct Cli {
     /// Run without opening a preview window. Useful when only relaying.
     #[arg(long)]
     headless: bool,
+
+    /// Pass audio from the capture card through to the system default output.
+    #[arg(long)]
+    audio: bool,
+
+    /// Substring matched against audio input device names (case insensitive).
+    /// If unset, the audio input that matches the chosen video device name is
+    /// preferred; failing that, the system default input is used.
+    #[arg(long)]
+    audio_device: Option<String>,
+
+    /// Initial audio sync delay in milliseconds. The capture card adds latency
+    /// to the video; audio typically arrives faster. Increase this until the
+    /// audio matches the picture. Live-adjustable from the F1 panel.
+    #[arg(long, default_value_t = 100)]
+    audio_delay_ms: u32,
+
+    /// Print audio input devices and exit.
+    #[arg(long)]
+    list_audio: bool,
 }
 
 fn main() -> Result<()> {
@@ -72,6 +93,19 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if cli.list_audio {
+        let names = audio::list_input_devices();
+        if names.is_empty() {
+            println!("No audio input devices found.");
+        } else {
+            println!("Audio input devices:");
+            for n in names {
+                println!("  - {n}");
+            }
+        }
+        return Ok(());
+    }
+
     let device_index = match cli.device {
         Some(i) => i,
         None => capture::pick_device_interactive()?,
@@ -80,6 +114,14 @@ fn main() -> Result<()> {
     if cli.probe {
         return capture::probe(device_index);
     }
+
+    let video_device_name = capture::enumerate()
+        .ok()
+        .and_then(|devs| {
+            devs.into_iter()
+                .find(|d| capture::index_of(d) == device_index)
+                .map(|d| d.human_name())
+        });
 
     let request = capture::CaptureRequest {
         device_index,
@@ -115,6 +157,19 @@ fn main() -> Result<()> {
     let _capture_handle = capture::spawn(request, shared.clone(), notifier)
         .context("failed to start capture thread")?;
 
+    let audio_runtime = if cli.audio {
+        let hint = cli.audio_device.as_deref().or(video_device_name.as_deref());
+        match audio::start(hint, cli.audio_delay_ms) {
+            Ok(rt) => Some(Arc::new(rt)),
+            Err(e) => {
+                log::error!("audio passthrough disabled: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     if let Some(addr) = cli.serve {
         relay::spawn(addr, shared.clone(), shared_settings.clone())
             .context("failed to start MJPEG relay")?;
@@ -128,8 +183,11 @@ fn main() -> Result<()> {
                 std::thread::park();
             }
         }
-        Some(el) => preview::run(el, shared, shared_settings, capture_info)?,
+        Some(el) => preview::run(el, shared, shared_settings, capture_info, audio_runtime.clone())?,
     }
+
+    // Keep audio alive until the preview exits.
+    drop(audio_runtime);
 
     Ok(())
 }

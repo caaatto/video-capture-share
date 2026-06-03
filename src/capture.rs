@@ -69,6 +69,10 @@ pub fn pick_device_interactive() -> Result<u32> {
 }
 
 fn extract_index(info: &CameraInfo) -> u32 {
+    index_of(info)
+}
+
+pub fn index_of(info: &CameraInfo) -> u32 {
     match info.index() {
         CameraIndex::Index(i) => *i,
         CameraIndex::String(_) => 0,
