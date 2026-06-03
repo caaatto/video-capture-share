@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.vscode/
+.idea/
+*.pdb
+*.exe.stackdump
+Thumbs.db
+Desktop.ini

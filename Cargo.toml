@@ -1,0 +1,36 @@
+[package]
+name = "video-capture-share"
+version = "0.1.0"
+edition = "2021"
+authors = ["caaatto"]
+license = "MIT"
+description = "Low overhead capture card preview and LAN relay for streamers"
+repository = "https://github.com/caaatto/video-capture-share"
+
+[[bin]]
+name = "video-capture-share"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+nokhwa = { version = "0.10", features = ["input-msmf", "input-native"] }
+softbuffer = "0.4"
+winit = "0.30"
+tiny_http = "0.12"
+turbojpeg = { version = "1", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+parking_lot = "0.12"
+log = "0.4"
+env_logger = "0.11"
+
+[features]
+default = []
+fast-jpeg = ["turbojpeg"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = true
+panic = "abort"
