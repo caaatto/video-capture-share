@@ -149,6 +149,24 @@ The Performance section in F1 shows your actual capture interval (target 16.7 ms
 
 vicash does not replace OBS. It does not encode, composite, or stream to Twitch. No scenes, no transitions, no effects, no recording.
 
+## Troubleshooting
+
+### Desktop crashes / black wallpaper / DWM heap corruption
+
+vicash uses wgpu for rendering. On Windows, wgpu picks DX12 first and falls back to Vulkan only if DX12 is unavailable. If you experienced a desktop crash before v0.1.2 with the Vulkan-backed build, that is exactly the DWM + Vulkan + old NVIDIA driver failure mode the DX12 preference avoids. Keep your GPU driver current and stick with the v0.1.2 or later build.
+
+### Capture device stuck after a previous run
+
+Cheap USB capture cards leave the Media Foundation source reader locked for a few seconds after a process exits. If vicash logs `Hardware MFT failed to start streaming due to lack of hardware resources` on launch, close any other app that touches the card (OBS, browser tab opened to /stream) and wait 5-10 seconds before trying again.
+
+### Port 8080 / Windows error 10013
+
+Windows reserves dynamic ranges for Hyper-V, WSL, Docker and IIS that often swallow 8080. vicash defaults to 7777 for that reason. If even 7777 is taken, try 8181, 9090 or 5500 in the F1 panel.
+
+### Audio is local only
+
+The MJPEG relay over LAN currently carries video, not audio. See [issue #1](https://github.com/caaatto/vicash/issues/1) for the state of the audio relay work.
+
 ## Build from source
 
 Requires a Rust toolchain (stable). On Windows you also need either the MSVC build tools, or the GNU toolchain (`rustup default stable-x86_64-pc-windows-gnu`) with MinGW-w64 on PATH so `windres.exe` can compile the embedded icon resource.

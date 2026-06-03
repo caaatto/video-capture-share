@@ -401,8 +401,18 @@ impl ApplicationHandler<UiEvent> for App {
 
 async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
     let size = window.inner_size();
+    // Prefer DX12 over Vulkan on Windows because Vulkan + NVIDIA + Desktop
+    // Window Manager has a long history of dwmcore heap corruption that
+    // takes the whole desktop down. DX12 lives closer to the Windows
+    // graphics stack and avoids the failure mode. Other platforms keep the
+    // wgpu default.
+    let backends = if cfg!(windows) {
+        wgpu::Backends::DX12 | wgpu::Backends::VULKAN
+    } else {
+        wgpu::Backends::PRIMARY
+    };
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
+        backends,
         ..Default::default()
     });
     let surface = instance.create_surface(window.clone())
