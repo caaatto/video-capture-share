@@ -676,13 +676,14 @@ fn toggle_recording(capture: &Arc<CaptureController>, handle: &RecordingHandle) 
 
 async fn init_gpu(window: Arc<Window>) -> Result<Gpu> {
     let size = window.inner_size();
-    // Prefer DX12 over Vulkan on Windows because Vulkan + NVIDIA + Desktop
-    // Window Manager has a long history of dwmcore heap corruption that
-    // takes the whole desktop down. DX12 lives closer to the Windows
-    // graphics stack and avoids the failure mode. Other platforms keep the
-    // wgpu default.
+    // Force DX12 on Windows. Vulkan + NVIDIA + Desktop Window Manager has
+    // a long history of dwmcore heap corruption (exception 0xc00001ad)
+    // that takes the whole desktop down. v0.1.2 claimed to "prefer" DX12
+    // but actually listed BOTH backends, leaving wgpu free to pick Vulkan
+    // anyway, which it did. Listing DX12 alone is the only reliable way
+    // to keep the Vulkan path out of the process entirely.
     let backends = if cfg!(windows) {
-        wgpu::Backends::DX12 | wgpu::Backends::VULKAN
+        wgpu::Backends::DX12
     } else {
         wgpu::Backends::PRIMARY
     };
